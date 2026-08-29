@@ -1,13 +1,14 @@
 #ifndef UNIFIEDCACHE_COMPRESSOR_CC_ACTION_H
 #define UNIFIEDCACHE_COMPRESSOR_CC_ACTION_H
 
+#include <atomic>
 #include <condition_variable>
-#include <unistd.h>
+#include <memory>
+#include <mutex>
 #include "codec.h"
 #include "global_config.h"
 #include "memory_pool.h"
 #include "template/hashset.h"
-#include "template/spsc_ring_queue.h"
 #include "thread/latch.h"
 #include "thread/thread_pool.h"
 #include "trans_task.h"
@@ -18,55 +19,87 @@ namespace UC::Compressor {
 class CompressorAction {
     using TaskPtr = std::shared_ptr<TransTask>;
     using WaiterPtr = std::shared_ptr<Latch>;
-    using TaskPair = std::pair<TaskPtr, WaiterPtr>;
+    using FailureSet = HashSet<Detail::TaskHandle>;
 
-    struct ShardTask {
-        Detail::TaskHandle taskHandle;
-        Detail::Shard* shard;
-        Detail::TaskHandle backendTaskHandle;
+    struct CompressTask {
+        TaskPtr task;
         WaiterPtr waiter;
+    };
+
+    struct LoadAggregate {
+        std::atomic<size_t> remaining;
+        std::atomic<size_t> r160HighPrecision{0};
+        std::atomic<size_t> r160Quantized{0};
+        std::atomic<size_t> r200Tunstall{0};
+        std::atomic<size_t> r200Fp8Fallback{0};
+
+        explicit LoadAggregate(size_t nShard) : remaining{nShard} {}
+    };
+    using LoadAggregatePtr = std::shared_ptr<LoadAggregate>;
+
+    struct LoadShardCtx {
+        TaskPtr task;
+        WaiterPtr waiter;
+        LoadAggregatePtr aggregate;
+        size_t shardIndex{0};
+    };
+
+    struct LoadWaitCtx {
+        LoadShardCtx shard;
+        Detail::TaskHandle backendHandle{0};
     };
 
 private:
     StoreV1* backend_{nullptr};
-    HashSet<Detail::TaskHandle>* failureSet_{nullptr};
+    FailureSet* failureSet_{nullptr};
     size_t shardSize_{0};
     size_t compressedShardSize_{0};
-    size_t decompressThreadNum{6};
+    size_t decompressThreadNum_{6};
+    static constexpr size_t kMaxActiveLoads = 128;
+    static constexpr size_t kMaxOutstandingWork = 8192;
     std::unique_ptr<Codec> codec_;
 
-    struct CompressTask {
-        std::shared_ptr<TransTask> task;
-        std::shared_ptr<Latch> waiter;
-    };
-    ThreadPool<CompressTask> dump_pool_;
-    ThreadPool<CompressTask> load_pool_;
-    std::unique_ptr<uint8_t[]> threadBuf_{0};
+    // Declaration order is intentional. Once the destructor drains all accepted work,
+    // ThreadPool members are destroyed in reverse pipeline order: submit, wait, decode, dump.
+    ThreadPool<CompressTask> dumpPool_;
+    ThreadPool<LoadShardCtx> decodePool_;
+    ThreadPool<LoadWaitCtx> waitPool_;
+    ThreadPool<LoadShardCtx> submitPool_;
 
-    alignas(64) std::atomic_bool stop_{false};
-    Detail::TaskHandle finishedBackendTaskHandle_{0};
-    SpscRingQueue<TaskPair> waiting_;
-    SpscRingQueue<ShardTask> running_;
-    std::thread dispatcher_;
-    std::thread transfer_;
+    std::mutex lifecycleMtx_;
+    std::condition_variable lifecycleCv_;
+    size_t outstandingWork_{0};
+    bool accepting_{true};
 
-    std::mutex waiterMtx_;
-    std::mutex backendMtx_;
-    std::atomic<Detail::TaskHandle> backendTaskHandle_{0};
-    std::condition_variable cv_;
+    std::mutex activeLoadMtx_;
+    std::condition_variable activeLoadCv_;
+    size_t activeLoads_{0};
 
 public:
     ~CompressorAction();
-    Status Setup(const Config& config, HashSet<Detail::TaskHandle>* failureSet);
+    Status Setup(const Config& config, FailureSet* failureSet);
     void Push(TaskPtr task, WaiterPtr waiter);
 
 private:
-    void Compress_Dump(CompressTask& ios);
-    void Compress_Load(CompressTask& ios);
+    void ProcessDump(CompressTask& task) noexcept;
+    void CompressDump(CompressTask& task);
 
-    void DispatchStage();
-    void DispatchOneTask(TaskPair&& pair);
-    void TransferOneTask(ShardTask&& task);
+    void SubmitLoadShard(LoadShardCtx& ctx) noexcept;
+    void WaitLoadShard(LoadWaitCtx& ctx) noexcept;
+    void DecodeLoadShard(LoadShardCtx& ctx) noexcept;
+
+    bool RegisterWork(size_t count);
+    void CompleteWork() noexcept;
+    void AcquireLoadSlot();
+    void ReleaseLoadSlot() noexcept;
+    void FinishLoadShard(const LoadShardCtx& ctx, CodecPayloadMode mode,
+                         bool holdsLoadSlot) noexcept;
+    void RecordPayloadMode(const LoadAggregatePtr& aggregate, CodecPayloadMode mode) noexcept;
+    void ReportLoadModeStats(const LoadShardCtx& ctx, CodecPayloadMode mode) const noexcept;
+    Status WaitBackendHandle(Detail::TaskHandle backendHandle, Detail::TaskHandle taskId,
+                             const char* stage) noexcept;
+    bool IsTaskFailed(Detail::TaskHandle taskId) const noexcept;
+    void MarkTaskFailed(Detail::TaskHandle taskId) noexcept;
 };
 
 }  // namespace UC::Compressor
