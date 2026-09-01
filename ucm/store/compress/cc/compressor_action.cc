@@ -96,8 +96,11 @@ Status CompressorAction::Setup(const Config& config, HashSet<Detail::TaskHandle>
     compressedShardSize_ = config.compressedShardSize;
     decompressThreadNum = config.decompressThreadNum;
 
-    codec_ = MakeCodec(static_cast<FixedRatio>(config.compressRatio),
-                       static_cast<DataType>(config.dataType), compressedShardSize_);
+    const auto ratio = static_cast<FixedRatio>(config.compressRatio);
+    const auto dataType = static_cast<DataType>(config.dataType);
+    codec_ = ratio == R160 && dataType == DT_BF16
+                 ? MakeR160BaseCodec(compressedShardSize_)
+                 : MakeCodec(ratio, dataType, compressedShardSize_);
     if (!codec_) {
         return Status::InvalidParam("Unsupported codec combo (ratio={}, dtype={})",
                                     config.compressRatio, config.dataType);

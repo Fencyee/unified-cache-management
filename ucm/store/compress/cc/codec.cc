@@ -23,6 +23,7 @@
  * */
 #include "codec.h"
 #include <limits>
+#include "compress_lib/r160_base_bf16.h"
 #include "compress_lib/tunstall_bf16_r160.h"
 #include "compress_lib/tunstall_bf16_r200.h"
 
@@ -143,6 +144,65 @@ private:
 };
 
 // ===================================================================
+// R160BaseCodec — R160-Base, fixed 4-KiB record with Base15 exceptions
+// ===================================================================
+class R160BaseCodec final : public Codec {
+public:
+    explicit R160BaseCodec(size_t compressedBytes) : compressedBytes_(compressedBytes) {}
+
+    bool NeedsCompress() const override { return true; }
+    bool NeedsDecompress() const override { return true; }
+
+    size_t CompressedSize(size_t originalBytes) const override
+    {
+        if ((originalBytes & 1U) != 0) { return 0; }
+        const size_t nBf16 = originalBytes >> 1;
+        const size_t minimumBytes = R160BaseMinimumBytes(nBf16);
+        if (minimumBytes == 0 || compressedBytes_ < minimumBytes ||
+            compressedBytes_ > originalBytes) {
+            return 0;
+        }
+        return compressedBytes_;
+    }
+
+    size_t CompressScratchSize(size_t originalBytes) const override
+    {
+        return CompressedSize(originalBytes);
+    }
+
+    int DecompressInplace(void* data, size_t originalBytes) const override
+    {
+        const size_t storedBytes = CompressedSize(originalBytes);
+        if (storedBytes == 0) { return R_ERR_UNSUPPORT; }
+        return R160BaseDecompressBF16Inplace(static_cast<uint8_t*>(data), originalBytes >> 1,
+                                             storedBytes);
+    }
+
+    size_t Compress(void* dst, const void* src, size_t originalBytes) const override
+    {
+        const size_t storedBytes = CompressedSize(originalBytes);
+        if (storedBytes == 0) { return 0; }
+        const int error =
+            R160BaseCompressBF16(static_cast<uint8_t*>(dst), storedBytes,
+                                 static_cast<const uint16_t*>(src), originalBytes >> 1);
+        return error == R_TS_OK ? storedBytes : 0;
+    }
+
+    CodecPayloadMode GetPayloadMode(const void* data, size_t payloadBytes,
+                                    size_t originalBytes) const override
+    {
+        if ((originalBytes & 1U) != 0 ||
+            !R160BaseIsValid(static_cast<const uint8_t*>(data), payloadBytes, originalBytes >> 1)) {
+            return CodecPayloadMode::INVALID;
+        }
+        return CodecPayloadMode::R160_HIGH_PRECISION;
+    }
+
+private:
+    size_t compressedBytes_;
+};
+
+// ===================================================================
 // Bf16R200Codec — R200 (2.0x), BF16 Tunstall 算法
 // ===================================================================
 class Bf16R200Codec : public Codec {
@@ -209,6 +269,11 @@ std::unique_ptr<Codec> MakeCodec(FixedRatio ratio, DataType dataType, size_t com
         case R200: return std::make_unique<Bf16R200Codec>(compressedBytes);
         default: return nullptr;
     }
+}
+
+std::unique_ptr<Codec> MakeR160BaseCodec(size_t compressedBytes)
+{
+    return std::make_unique<R160BaseCodec>(compressedBytes);
 }
 
 }  // namespace UC::Compressor

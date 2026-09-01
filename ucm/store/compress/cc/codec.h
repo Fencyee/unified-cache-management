@@ -108,6 +108,9 @@ public:
  */
 std::unique_ptr<Codec> MakeCodec(FixedRatio ratio, DataType dataType, size_t compressedBytes);
 
+/// Creates the Base15 fixed-record implementation used for the R160 BF16 path.
+std::unique_ptr<Codec> MakeR160BaseCodec(size_t compressedBytes);
+
 /// Human-readable name for codec and R160 decode errors.
 const char* CodecErrorName(int error) noexcept;
 

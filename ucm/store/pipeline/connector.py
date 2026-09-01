@@ -236,11 +236,19 @@ def _build_cache_compress_posix_pipeline(
             )
             return
         layers = posix_config["block_size"] // posix_config["shard_size"]
-        compressed_shard_size = (
-            (posix_config["shard_size"] * posix_config["compress_ratio"] // 32)
-            // 4096
-            * 4096
+        nominal_compressed_size = (
+            posix_config["shard_size"] * posix_config["compress_ratio"] // 32
         )
+        if posix_config["compress_ratio"] == 20:
+            # R160-Base stores 5/8 of the raw bytes as fixed data, plus a
+            # one-byte range base and a rare exponent-exception tail. Allocate
+            # the next 4-KiB record; remaining space preserves optional M1/M0
+            # bits, while the codec rejects exception overflow.
+            compressed_shard_size = (
+                (nominal_compressed_size + 1 + 4095) // 4096 * 4096
+            )
+        else:
+            compressed_shard_size = nominal_compressed_size // 4096 * 4096
         if compressed_shard_size == 0:
             raise ValueError(
                 "compressed shard size is zero after 4096-byte alignment: "
