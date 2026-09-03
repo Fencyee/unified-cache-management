@@ -1,0 +1,4 @@
+datasets>=3.0
+openai>=1.0
+transformers>=4.51
+tqdm>=4.60

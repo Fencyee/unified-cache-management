@@ -1,0 +1,4 @@
+# Install these into an existing torch/torch-npu environment.
+transformers>=4.51,<6
+accelerate>=1.10,<2
+datasets>=3,<5
