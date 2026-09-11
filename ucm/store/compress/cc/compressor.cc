@@ -37,6 +37,10 @@ private:
         if (config.deviceId < -1) {
             return Status::InvalidParam("invalid device({})", config.deviceId);
         }
+        if (config.metricsLevel != "off" && config.metricsLevel != "basic" &&
+            config.metricsLevel != "detailed") {
+            return Status::InvalidParam("invalid compress_metrics_level({})", config.metricsLevel);
+        }
 
         // TODO 参数校验
         return Status::OK();
@@ -50,6 +54,7 @@ private:
         UC_INFO("{}-{}({}).", ns, UCM_COMMIT_ID, buildType);
         UC_INFO("Set {}::StoreBackend to {}.", ns, backend->Readme());
         UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
+        UC_INFO("Set {}::MetricsLevel to {}.", ns, config.metricsLevel);
     }
 };
 
@@ -68,6 +73,7 @@ Status Compressor::Setup(const Detail::Dictionary& config)
     config.GetNumber("layer_size", param.layerSize);
     config.GetNumber("compress_ratio", param.compressRatio);
     config.GetNumber("data_type", param.dataType);
+    config.Get("compress_metrics_level", param.metricsLevel);
     config.GetNumber("decompress_thread_num", param.decompressThreadNum);
     config.GetNumber("timeout_ms", param.timeoutMs);
     config.GetNumber("stream_number", param.streamNumber);

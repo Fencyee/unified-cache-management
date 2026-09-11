@@ -15,3 +15,6 @@ ucm_connectors:
       posix_capacity_gb: 10240
       posix_io_engine: "psync"
       posix_data_trans_concurrency: 128
+      # Compress metrics level: off / basic / detailed.
+      # Used only when store_pipeline contains the Compress stage.
+      compress_metrics_level: "basic"

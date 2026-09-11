@@ -149,6 +149,26 @@ _COUNTER_METRICS = [
         "Number of Posix read, write, or AIO completion failures",
     ),
     (
+        "compress_load_tasks_total",
+        "Total Compress load tasks picked up by decompression workers",
+    ),
+    (
+        "compress_load_shards_total",
+        "Total shards contained in Compress load tasks",
+    ),
+    (
+        "compress_decode_bytes_total",
+        "Total uncompressed bytes successfully produced by the Compress load stage",
+    ),
+    (
+        "compress_decode_busy_seconds_total",
+        "Sum of wall-clock seconds spent in the decode phase across all decompression workers",
+    ),
+    (
+        "compress_backend_wait_seconds_total",
+        "Sum of wall-clock seconds Compress load workers spent waiting for the storage backend",
+    ),
+    (
         "yuanrong_load_success_shards_total",
         "Shards successfully loaded from YuanRong to device",
     ),
@@ -354,6 +374,36 @@ _COUNTER_METRICS = [
     ),
 ]
 _GAUGE_METRICS = [
+    (
+        "compress_load_queue_depth",
+        "Current number of tasks waiting for a combined backend-load/decode worker",
+        {"multiprocess_mode": 'livesum'},
+    ),
+    (
+        "compress_load_active_workers",
+        "Current number of Compress load workers holding a task, including backend wait",
+        {"multiprocess_mode": 'livesum'},
+    ),
+    (
+        "compress_backend_wait_active_workers",
+        "Current number of Compress load workers blocked in backend Wait",
+        {"multiprocess_mode": 'livesum'},
+    ),
+    (
+        "compress_decode_active_workers",
+        "Current number of Compress load workers executing the decode phase",
+        {"multiprocess_mode": 'livesum'},
+    ),
+    (
+        "compress_decompress_thread_count",
+        "Configured decompression worker count",
+        {"multiprocess_mode": 'livesum'},
+    ),
+    (
+        "compress_load_queue_high_watermark",
+        "Maximum Compress load queue depth observed by one worker process",
+        {"multiprocess_mode": 'livemax'},
+    ),
     (
         "cache_lookup_hit_rate",
         "Instantaneous Cache stage hit rate from the most recent lookup call",
@@ -593,6 +643,26 @@ _HISTOGRAM_METRICS = [
             "(ms). Large => storage write is the bottleneck."
         ),
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000],
+    ),
+    (
+        "compress_load_queue_wait_duration_ms",
+        "Time a Compress load task waited before a decompression worker picked it up (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 500, 1000],
+    ),
+    (
+        "compress_backend_wait_duration_ms",
+        "Time a Compress load worker spent waiting for the backend load task (ms)",
+        [0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+    ),
+    (
+        "compress_decode_duration_ms",
+        "Wall-clock time spent decoding all shards in one Compress load task (ms)",
+        [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "compress_decode_bandwidth_gbps",
+        "Compress decode bandwidth per load task based on uncompressed output bytes (GB/s)",
+        [0.05, 0.1, 0.2, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 8, 10, 12, 16, 24, 32, 48, 64, 96, 128],
     ),
     (
         "posix_load_task_duration_ms",

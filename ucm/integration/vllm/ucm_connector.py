@@ -1311,6 +1311,17 @@ class UCMDirectConnector(KVConnectorBase_V1):
             config["storage_backends"] = backends
         config["unique_id"] = f"{self.unique_id}"
         if self._role == KVConnectorRole.WORKER:
+            if config.get("store_pipeline") == "Cache|Compress|Posix":
+                if self.kv_cache_dtype != torch.bfloat16:
+                    raise ValueError(
+                        "Compress supports only BF16 KV cache tensors, "
+                        f"but vLLM registered {self.kv_cache_dtype}."
+                    )
+                config["data_type"] = 0
+                logger.info(
+                    "Inferred Compress data_type=0 from actual KV cache dtype=%s.",
+                    self.kv_cache_dtype,
+                )
             config["device_id"] = self.local_rank
             tensor_size_list = kv_cache_layout.tensor_size_list * self.blocks_per_chunk
             logical_shard_size = kv_cache_layout.shard_size * self.blocks_per_chunk

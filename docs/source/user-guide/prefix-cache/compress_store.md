@@ -33,10 +33,10 @@ ucm_connectors:
       storage_backends: "/mnt/kv"
       # BF16 codec: 20=R160 (nominal 1.60x), 16=R200 (2.00x), 32=no compression
       compress_ratio: 20
-      # Data type configuration: 0=BF16, 100=INVALID, other values not supported yet
-      data_type: 0
       # Number of threads for parallel decompression
       decompress_thread_num: 24
+      # off=minimal overhead, basic=production counters, detailed=diagnostics
+      compress_metrics_level: "basic"
       # Whether to enable direct I/O
       io_direct: true
       # Cache buffer capacity in GB
@@ -59,8 +59,12 @@ enable_record_traces: false
 | Parameter Name | Supported/Recommended Values | Configuration Description and Notes |
 | :------------- | :--------------------------- | :----------------------------------- |
 | `compress_ratio` | 20 / 16 / 32 | BF16 codec selection.<br>20 = R160, nominal 1.60x, higher-precision option;<br>16 = R200, 2.00x, higher-compression option;<br>32 = no compression;<br>Other values are not supported. |
-| `data_type` | 0 | Tensor data type configuration.<br>0 = BF16 (the only supported type currently);<br>100 = INVALID;<br>Other values are not supported yet. |
 | `decompress_thread_num` | 24 / 36 / 48 | Number of parallel decompression workers.<br>R160: 24 workers are recommended as the starting point.<br>R200: 48 workers are recommended as the starting point.<br>36 workers can be used as an intermediate tuning point. The optimum still depends on shard size, CPU topology, storage bandwidth, and request concurrency. |
+| `compress_metrics_level` | off / basic / detailed | Compress observability level. Defaults to `basic`.<br>`off` skips the added timing, atomic accounting, and sampler thread;<br>`basic` records task count, shard count, decoded bytes, and configured thread count;<br>`detailed` additionally records utilization, backend wait, queue state, and latency histograms. |
+
+The vLLM connector infers the Compress data type from the actual registered KV
+cache tensor. Do not configure `data_type` manually. The current codec supports
+only BF16 and fails service startup if vLLM registers a non-BF16 KV cache.
 
 For Posix direct I/O, the pipeline rounds the nominal compressed shard size down to a 4 KiB boundary. Therefore, the effective R160 ratio can be slightly higher than 1.60x for shard sizes whose nominal 5/8 payload is not already 4 KiB aligned.
 
@@ -100,7 +104,7 @@ vllm serve Qwen/Qwen3-32B \
 ### 3.3 Startup Success Indicator
 The following log indicates that the service is started successfully and the compression module is loaded and working properly:
 ```
-[UC][I] Using UCM with config: {'ucm_connectors': [{'ucm_connector_name': 'UcmPipelineStore', 'ucm_connector_config': {'store_pipeline': 'Cache|Compress|Posix', 'storage_backends': './kv', 'compress_ratio': 20, 'data_type': 0, 'decompress_thread_num': 24, 'io_direct': True, 'cache_buffer_capacity_gb': 64, 'posix_io_engine': 'aio'}}], 'use_layerwise': True, 'enable_record_traces': False}
+[UC][I] Inferred Compress data_type=0 from actual KV cache dtype=torch.bfloat16.
 ```
 
 　
@@ -169,6 +173,52 @@ Set the environment variable UC_LOGGER_LEVEL=debug to print detailed logs of the
 [UC][D] COMPRESS LOAD | shard: xx, done, decompressed_size: xx
 [UC][D] COMPRESS LOAD END | task_id: xx
 ```
+
+### 4.4 Decompression Worker Utilization and Queue Depth
+
+Set `compress_metrics_level: "detailed"` and restart the service before collecting
+the utilization and queue metrics in this section. The default `basic` mode does
+not start the 100-ms sampler thread.
+
+The current load worker executes both backend waiting and decompression. Therefore,
+`compress_load_active_workers` includes workers blocked on Posix, while
+`compress_decode_active_workers` counts only workers in the decode phase.
+
+Inspect the metrics exported by the vLLM endpoint:
+
+```bash
+curl -s http://127.0.0.1:8000/metrics | grep 'compress_'
+```
+
+Important metrics:
+
+- `compress_load_queue_depth`: tasks waiting for a combined backend-load/decode worker.
+- `compress_backend_wait_active_workers`: workers currently blocked on backend load completion.
+- `compress_decode_active_workers`: workers currently executing decompression.
+- `compress_load_queue_high_watermark`: maximum queue depth observed by one TP worker.
+- `compress_decode_bytes_total`: uncompressed bytes successfully produced.
+- `compress_decode_busy_seconds_total`: decode-phase wall time summed across workers.
+- `compress_backend_wait_seconds_total`: backend-wait wall time summed across workers.
+
+PromQL examples, where `compress_decompress_thread_count` is aggregated across TP workers:
+
+```promql
+# Actual decompression-worker utilization, 0 to 100 percent
+100 * sum(rate(ucm:compress_decode_busy_seconds_total[30s]))
+    / sum(ucm:compress_decompress_thread_count)
+
+# Aggregate decoded raw-data throughput in GB/s
+sum(rate(ucm:compress_decode_bytes_total[30s])) / 1e9
+
+# Fraction of configured worker capacity spent waiting for the backend
+100 * sum(rate(ucm:compress_backend_wait_seconds_total[30s]))
+    / sum(ucm:compress_decompress_thread_count)
+```
+
+Low decode utilization with high backend-wait utilization means storage is starving the
+decoder. Sustained queue growth together with high decode utilization means decompression
+is the bottleneck. `compress_load_queue_depth` is not a post-I/O decode-ready queue; the
+current implementation has no separate queue between backend completion and decode.
 
 　
 
@@ -259,7 +309,8 @@ This section specifies the mandatory prerequisites, recommended scenarios, and n
 The compression function can only be enabled when all of the following conditions are met:
 
 - Software stack: Use `UcmPipelineStore` with `store_pipeline: "Cache|Compress|Posix"`.
-- Data type: The current codec implementation supports BF16 (`data_type: 0`) only.
+- Data type: The actual registered KV cache tensors must all be BF16. The vLLM
+  connector detects this automatically; no `data_type` configuration is required.
 - Codec selection: Use `compress_ratio: 20` for R160 or `compress_ratio: 16` for R200. Both modes are lossy; `compress_ratio: 32` bypasses compression.
 - Storage backend: Use a Posix-compatible local file system, SSD, or mounted network file system. Compression does not benefit a pure HBM-only cache path.
 - Accuracy validation: Evaluate task-level accuracy and generated output quality with representative model inputs before production deployment. R160 normally retains more BF16 information than R200, but neither mode is bit-exact.

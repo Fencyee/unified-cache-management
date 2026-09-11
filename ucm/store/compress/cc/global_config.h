@@ -45,6 +45,7 @@ struct Config {
     size_t timeoutMs{30000};
     int32_t compressRatio{32};
     int32_t dataType{100};
+    std::string metricsLevel{"basic"};
     size_t streamNumber{8};
     size_t decompressThreadNum{6};
     std::vector<ssize_t> cpuAffinityCores{};

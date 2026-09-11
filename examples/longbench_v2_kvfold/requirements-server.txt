@@ -1,3 +1,0 @@
-# vLLM, vllm-ascend, torch and torch-npu are provided by the serving image.
-wrapt>=1.17
-
