@@ -15,6 +15,11 @@ ucm_connectors:
       posix_capacity_gb: 10240
       posix_io_engine: "psync"
       posix_data_trans_concurrency: 128
+      # Compress dump worker count. If omitted, legacy stream_number / 2 is used.
+      # Used only when store_pipeline contains the Compress stage.
+      compress_thread_num: 4
+      # Compress load/decode worker count.
+      decompress_thread_num: 24
       # Compress metrics level: off / basic / detailed.
       # Used only when store_pipeline contains the Compress stage.
       compress_metrics_level: "basic"

@@ -33,6 +33,8 @@ ucm_connectors:
       storage_backends: "/mnt/kv"
       # BF16 codec: 20=R160 (nominal 1.60x), 16=R200 (2.00x), 32=no compression
       compress_ratio: 20
+      # Number of threads for parallel compression
+      compress_thread_num: 4
       # Number of threads for parallel decompression
       decompress_thread_num: 24
       # off=minimal overhead, basic=production counters, detailed=diagnostics
@@ -58,7 +60,8 @@ enable_record_traces: false
 ### 2.3 Compression-Specific Optional Parameters
 | Parameter Name | Supported/Recommended Values | Configuration Description and Notes |
 | :------------- | :--------------------------- | :----------------------------------- |
-| `compress_ratio` | 20 / 16 / 32 | BF16 codec selection.<br>20 = R160, nominal 1.60x, higher-precision option;<br>16 = R200, 2.00x, higher-compression option;<br>32 = no compression;<br>Other values are not supported. |
+| `compress_ratio` | 20 / 16 / 32 | BF16 codec selection.<br>20 = R160, nominal 1.60x, higher-precision option;<br>16 = R200, 2.00x, higher-compression option;<br>32 = no codec compression/decompression while retaining the Compress stage, for measuring its framework overhead;<br>Other values are not supported. |
+| `compress_thread_num` | Positive integer, default 4 | Number of parallel compression/dump workers. When omitted, Compress remains backward compatible with the legacy `stream_number / 2` setting. Prefer this explicit option for new configurations. |
 | `decompress_thread_num` | 24 / 36 / 48 | Number of parallel decompression workers.<br>R160: 24 workers are recommended as the starting point.<br>R200: 48 workers are recommended as the starting point.<br>36 workers can be used as an intermediate tuning point. The optimum still depends on shard size, CPU topology, storage bandwidth, and request concurrency. |
 | `compress_metrics_level` | off / basic / detailed | Compress observability level. Defaults to `basic`.<br>`off` skips the added timing, atomic accounting, and sampler thread;<br>`basic` records task count, shard count, decoded bytes, and configured thread count;<br>`detailed` additionally records utilization, backend wait, queue state, and latency histograms. |
 
@@ -311,7 +314,7 @@ The compression function can only be enabled when all of the following condition
 - Software stack: Use `UcmPipelineStore` with `store_pipeline: "Cache|Compress|Posix"`.
 - Data type: The actual registered KV cache tensors must all be BF16. The vLLM
   connector detects this automatically; no `data_type` configuration is required.
-- Codec selection: Use `compress_ratio: 20` for R160 or `compress_ratio: 16` for R200. Both modes are lossy; `compress_ratio: 32` bypasses compression.
+- Codec selection: Use `compress_ratio: 20` for R160 or `compress_ratio: 16` for R200. Both modes are lossy; `compress_ratio: 32` bypasses only codec operations and retains the Compress stage for framework-overhead measurements.
 - Storage backend: Use a Posix-compatible local file system, SSD, or mounted network file system. Compression does not benefit a pure HBM-only cache path.
 - Accuracy validation: Evaluate task-level accuracy and generated output quality with representative model inputs before production deployment. R160 normally retains more BF16 information than R200, but neither mode is bit-exact.
 - Cache compatibility: Use a separate storage directory, or clear existing persisted cache data, when changing `compress_ratio` or codec versions.

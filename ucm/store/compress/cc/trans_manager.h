@@ -32,33 +32,35 @@
 namespace UC::Compressor {
 
 class TransManager : public Detail::TaskWrapper<TransTask, Detail::TaskHandle> {
-    size_t shardSize_;
-    CompressorAction compress_action;
+    size_t shardSize_{0};
+    CompressorAction action_;
 
 public:
     Status Setup(const Config& config)
     {
         timeoutMs_ = config.timeoutMs;
         shardSize_ = config.shardSize;
-        return compress_action.Setup(config, &failureSet_);
+        return action_.Setup(config, &failureSet_);
     }
 
 protected:
+    Status FailureStatus(const TaskPtr& task) const override { return task->FailureStatus(); }
     void Dispatch(TaskPtr t, WaiterPtr w) override
     {
         const auto id = t->id;
-        const auto& brief = t->desc.brief;
+        const auto brief = t->desc.brief;
         const auto num = t->desc.size();
         const auto size = shardSize_ * num;
         const auto tp = w->startTp;
         UC_DEBUG("Compressor task({},{},{},{},{}) dispatching.", id, brief, num, size, tp);
-        w->SetEpilog([id, brief = std::move(brief), num, size, tp] {
+        w->SetEpilog([id, brief, num, size, tp] {
             auto cost = NowTime::Now() - tp;
             UC_DEBUG("Compress task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
                      cost * 1e3);
         });
-        compress_action.Push(t, w);
+        action_.Push(t, w);
     }
+    void Cancel(TaskPtr task) override { action_.Cancel(std::move(task)); }
 };
 
 }  // namespace UC::Compressor

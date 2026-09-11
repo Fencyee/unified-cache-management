@@ -1,9 +1,11 @@
 #include "compressor_action.h"
 #include <chrono>
+#include <cstdlib>
 #include <exception>
+#include <limits>
+#include <memory>
+#include <new>
 #include <pthread.h>
-#include <queue>
-#include <vector>
 #include "logger/logger.h"
 #include "metrics_api.h"
 
@@ -11,6 +13,52 @@ namespace UC::Compressor {
 namespace {
 
 using SteadyClock = std::chrono::steady_clock;
+
+class CompletionGuard {
+public:
+    explicit CompletionGuard(std::shared_ptr<Latch> waiter) : waiter_(std::move(waiter)) {}
+    ~CompletionGuard() { waiter_->Done(); }
+
+    CompletionGuard(const CompletionGuard&) = delete;
+    CompletionGuard& operator=(const CompletionGuard&) = delete;
+
+private:
+    std::shared_ptr<Latch> waiter_;
+};
+
+class AlignedBlocks {
+public:
+    AlignedBlocks(size_t blockSize, size_t blockCount)
+        : data_(nullptr, &std::free), stride_(AlignedSize(blockSize))
+    {
+        if (blockCount == 0 || stride_ > std::numeric_limits<size_t>::max() / blockCount) {
+            throw std::bad_alloc();
+        }
+        void* data = nullptr;
+        if (posix_memalign(&data, ALIGNMENT, stride_ * blockCount) != 0) { throw std::bad_alloc(); }
+        data_.reset(data);
+    }
+
+    void* At(size_t index) const noexcept
+    {
+        return static_cast<uint8_t*>(data_.get()) + index * stride_;
+    }
+
+private:
+    static constexpr size_t ALIGNMENT = 4096;
+    using Buffer = std::unique_ptr<void, decltype(&std::free)>;
+
+    static size_t AlignedSize(size_t size)
+    {
+        if (size == 0 || size > std::numeric_limits<size_t>::max() - (ALIGNMENT - 1)) {
+            throw std::bad_alloc();
+        }
+        return (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+    }
+
+    Buffer data_;
+    size_t stride_;
+};
 
 class ActivityGuard {
 public:
@@ -130,19 +178,21 @@ Status CompressorAction::Setup(const Config& config, HashSet<Detail::TaskHandle>
     failureSet_ = failureSet;
     shardSize_ = config.shardSize;
     compressedShardSize_ = config.compressedShardSize;
-    decompressThreadNum = config.decompressThreadNum;
+    compressThreadNum_ = config.compressThreadNum;
+    decompressThreadNum_ = config.decompressThreadNum;
+    timeoutMs_ = config.timeoutMs;
     metricsLevel_ = config.metricsLevel == "off"     ? MetricsLevel::OFF
                     : config.metricsLevel == "basic" ? MetricsLevel::BASIC
                                                      : MetricsLevel::DETAILED;
 
     const auto ratio = static_cast<FixedRatio>(config.compressRatio);
-    const auto dataType = static_cast<DataType>(config.dataType);
+    const auto dataType = config.dataType;
     codec_ = ratio == R160 && dataType == DT_BF16
                  ? MakeR160BaseCodec(compressedShardSize_)
                  : MakeCodec(ratio, dataType, compressedShardSize_);
     if (!codec_) {
         return Status::InvalidParam("Unsupported codec combo (ratio={}, dtype={})",
-                                    config.compressRatio, config.dataType);
+                                    config.compressRatio, static_cast<int32_t>(config.dataType));
     }
 
     if ((shardSize_ & 1U) != 0) {
@@ -155,7 +205,8 @@ Status CompressorAction::Setup(const Config& config, HashSet<Detail::TaskHandle>
     if (codecCompressedSize != compressedShardSize_) {
         return Status::InvalidParam(
             "compressed shard size({}) is invalid for shardSize({}), ratio({}) and dtype({})",
-            compressedShardSize_, shardSize_, config.compressRatio, config.dataType);
+            compressedShardSize_, shardSize_, config.compressRatio,
+            static_cast<int32_t>(config.dataType));
     }
     if (codec_->NeedsCompress() && compressedShardSize_ % 4096 != 0) {
         return Status::InvalidParam(
@@ -163,23 +214,31 @@ Status CompressorAction::Setup(const Config& config, HashSet<Detail::TaskHandle>
             compressedShardSize_, shardSize_, config.compressRatio);
     }
 
-    dump_pool_.SetNWorker(config.streamNumber >> 1)
-        .SetCpuAffinity(config.cpuAffinityCores)
-        .SetWorkerFn([this](auto& ct, auto&) { Compress_Dump(ct); })
-        .Run();
+    const bool dumpPoolStarted = dumpPool_.SetNWorker(compressThreadNum_)
+                                     .SetCpuAffinity(config.cpuAffinityCores)
+                                     .SetWorkerFn([this](auto& task, auto&) { DumpWorker(task); })
+                                     .Run();
+    if (!dumpPoolStarted) {
+        return Status::Error(fmt::format("compress workers({}) start failed", compressThreadNum_));
+    }
 
-    load_pool_.SetNWorker(decompressThreadNum)
-        .SetCpuAffinity(config.cpuAffinityCores)
-        .SetWorkerFn([this](auto& ct, auto&) { Compress_Load(ct); })
-        .Run();
+    const bool loadPoolStarted = loadPool_.SetNWorker(decompressThreadNum_)
+                                     .SetCpuAffinity(config.cpuAffinityCores)
+                                     .SetWorkerFn([this](auto& task, auto&) { LoadWorker(task); })
+                                     .Run();
+    if (!loadPoolStarted) {
+        return Status::Error(
+            fmt::format("decompress workers({}) start failed", decompressThreadNum_));
+    }
 
-    UC_DEBUG("Compressor Setup OK | load_threads: {}, shard_size: {} B, stored_shard_size: {} B",
-             decompressThreadNum, shardSize_, compressedShardSize_);
+    UC_DEBUG(
+        "Compressor Setup OK | dump_threads: {}, load_threads: {}, shard_size: {} B, "
+        "stored_shard_size: {} B",
+        compressThreadNum_, decompressThreadNum_, shardSize_, compressedShardSize_);
 
-    threadBuf_ = std::make_unique<uint8_t[]>(shardSize_);
     if (MetricsEnabled()) {
         static Metrics::CachedMetric threadCount{"compress_decompress_thread_count"};
-        Metrics::UpdateStats(threadCount, static_cast<double>(decompressThreadNum));
+        Metrics::UpdateStats(threadCount, static_cast<double>(decompressThreadNum_));
     }
     if (!DetailedMetricsEnabled()) { return Status::OK(); }
     try {
@@ -201,7 +260,6 @@ void CompressorAction::MetricsLoop()
     static Metrics::CachedMetric loadActive{"compress_load_active_workers"};
     static Metrics::CachedMetric backendWaitActive{"compress_backend_wait_active_workers"};
     static Metrics::CachedMetric decodeActive{"compress_decode_active_workers"};
-    static Metrics::CachedMetric threadCount{"compress_decompress_thread_count"};
 
     while (!metricsStop_.load(std::memory_order_relaxed)) {
         Metrics::UpdateStats(queueDepth,
@@ -217,8 +275,6 @@ void CompressorAction::MetricsLoop()
         Metrics::UpdateStats(
             decodeActive,
             static_cast<double>(decodeActiveWorkers_.load(std::memory_order_relaxed)));
-        Metrics::UpdateStats(threadCount, static_cast<double>(decompressThreadNum));
-
         std::unique_lock<std::mutex> lock(metricsMtx_);
         metricsCv_.wait_for(lock, kReportInterval,
                             [this] { return metricsStop_.load(std::memory_order_relaxed); });
@@ -250,220 +306,260 @@ void CompressorAction::Push(TaskPtr task, WaiterPtr waiter)
     UC_DEBUG("Task Pushed | id: {}, type: {}, shards: {}", task->id, type, task->desc.size());
 
     waiter->Set(1);
-    if (task->type == TransTask::Type::DUMP) {
-        dump_pool_.Push(CompressTask{task, waiter, {}});
-    } else if (task->type == TransTask::Type::LOAD) {
-        SteadyClock::time_point enqueueTp{};
-        if (DetailedMetricsEnabled()) {
-            const size_t depth = loadQueueDepth_.fetch_add(1, std::memory_order_relaxed) + 1;
-            UpdateHighWatermark(loadQueueHighWatermark_, depth);
-            enqueueTp = SteadyClock::now();
+    const bool isLoad = task->type == TransTask::Type::LOAD;
+    SteadyClock::time_point enqueueTp{};
+    if (isLoad && DetailedMetricsEnabled()) {
+        const size_t depth = loadQueueDepth_.fetch_add(1, std::memory_order_relaxed) + 1;
+        UpdateHighWatermark(loadQueueHighWatermark_, depth);
+        enqueueTp = SteadyClock::now();
+    }
+    try {
+        if (isLoad) {
+            loadPool_.Push(CompressTask{task, waiter, enqueueTp});
+        } else {
+            dumpPool_.Push(CompressTask{task, waiter, {}});
         }
-        load_pool_.Push(CompressTask{task, waiter, enqueueTp});
+    } catch (const std::exception& e) {
+        if (isLoad) { DecrementLoadQueueDepth(task->id); }
+        FailTask(task, type, "queue submit", Status::Error(e.what()));
+        waiter->Done();
+    } catch (...) {
+        if (isLoad) { DecrementLoadQueueDepth(task->id); }
+        FailTask(task, type, "queue submit", Status::Error("unknown exception"));
+        waiter->Done();
     }
 }
 
-void CompressorAction::Compress_Load(CompressTask& ct)
+void CompressorAction::Cancel(TaskPtr task)
 {
-    static Metrics::CachedMetric loadTasks{"compress_load_tasks_total"};
-    static Metrics::CachedMetric loadShards{"compress_load_shards_total"};
-    static Metrics::CachedMetric queueWait{"compress_load_queue_wait_duration_ms"};
-    static Metrics::CachedMetric decodeBytes{"compress_decode_bytes_total"};
-    static Metrics::CachedMetric decodeBusySeconds{"compress_decode_busy_seconds_total"};
-    static Metrics::CachedMetric decodeDuration{"compress_decode_duration_ms"};
-    static Metrics::CachedMetric decodeBandwidth{"compress_decode_bandwidth_gbps"};
+    auto& pool = task->type == TransTask::Type::LOAD ? loadPool_ : dumpPool_;
+    pool.TraverseWaitQueue(
+        [this, id = task->id](CompressTask& queued) {
+            return queued.task->id == id || queued.waiter->IsTimeout(timeoutMs_);
+        },
+        [this](CompressTask& queued) { FinishCancelledTask(queued); }, nullptr);
+}
 
-    const bool metricsEnabled = MetricsEnabled();
-    const bool detailedMetricsEnabled = DetailedMetricsEnabled();
-    if (detailedMetricsEnabled) {
-        const auto pickedTp = SteadyClock::now();
-        const size_t previousDepth = loadQueueDepth_.fetch_sub(1, std::memory_order_relaxed);
-        if (previousDepth == 0) [[unlikely]] {
-            loadQueueDepth_.store(0, std::memory_order_relaxed);
-            UC_WARN("Compressor load queue depth underflow for task({}).", ct.task->id);
-        }
-        if (ct.enqueueTp != SteadyClock::time_point{}) {
-            const double queuedSeconds =
-                std::chrono::duration<double>(pickedTp - ct.enqueueTp).count();
-            Metrics::UpdateStats(queueWait, queuedSeconds * 1e3);
-        }
-    }
-    if (metricsEnabled) {
-        Metrics::UpdateStats(loadTasks, 1.0);
-        Metrics::UpdateStats(loadShards, static_cast<double>(ct.task->desc.size()));
-    }
-    ActivityGuard loadGuard(detailedMetricsEnabled ? &loadActiveWorkers_ : nullptr);
+void CompressorAction::FailTask(const TaskPtr& task, const char* operation, const char* stage,
+                                const Status& status)
+{
+    UC_ERROR("COMPRESS {} FAILED | task_id: {}, stage: {}, status: {}", operation, task->id, stage,
+             status);
+    task->Fail(status);
+    failureSet_->Insert(task->id);
+}
 
-    UC_DEBUG("COMPRESS LOAD START | task_id: {}", ct.task->id);
-    auto fail = [this, &ct](const char* stage, const Status& status) {
-        UC_ERROR("COMPRESS LOAD FAILED | task_id: {}, stage: {}, status: {}", ct.task->id, stage,
-                 status);
-        failureSet_->Insert(ct.task->id);
-    };
-    if (!codec_->NeedsDecompress()) {
-        auto result = backend_->Load(std::move(ct.task->desc));
-        if (!result) {
-            fail("backend submit", result.Error());
-        } else {
-            auto status = WaitLoadBackend(result.Value());
-            if (status.Failure()) { fail("backend wait", status); }
-        }
-        ct.waiter->Done();
-        UC_DEBUG("COMPRESS LOAD END | task_id: {}", ct.task->id);
-        return;
-    }
+void CompressorAction::FinishCancelledTask(CompressTask& task)
+{
+    if (task.task->type == TransTask::Type::LOAD) { DecrementLoadQueueDepth(task.task->id); }
+    task.task->Fail(Status::Timeout());
+    failureSet_->Insert(task.task->id);
+    task.waiter->Done();
+}
 
-    auto result = backend_->Load(ct.task->desc);
-    if (!result) {
-        fail("backend submit", result.Error());
-        ct.waiter->Done();
-        return;
+void CompressorAction::DecrementLoadQueueDepth(Detail::TaskHandle taskHandle)
+{
+    if (!DetailedMetricsEnabled()) { return; }
+    const size_t previousDepth = loadQueueDepth_.fetch_sub(1, std::memory_order_relaxed);
+    if (previousDepth == 0) [[unlikely]] {
+        loadQueueDepth_.store(0, std::memory_order_relaxed);
+        UC_WARN("Compressor load queue depth underflow for task({}).", taskHandle);
     }
-    if (result.Value() > 0) {
-        auto status = WaitLoadBackend(result.Value());
-        if (status.Failure()) {
-            fail("backend wait", status);
-            ct.waiter->Done();
+}
+
+void CompressorAction::LoadWorker(CompressTask& ct)
+{
+    CompletionGuard completion{ct.waiter};
+    try {
+        static Metrics::CachedMetric loadTasks{"compress_load_tasks_total"};
+        static Metrics::CachedMetric loadShards{"compress_load_shards_total"};
+        static Metrics::CachedMetric queueWait{"compress_load_queue_wait_duration_ms"};
+        static Metrics::CachedMetric decodeBytes{"compress_decode_bytes_total"};
+        static Metrics::CachedMetric decodeBusySeconds{"compress_decode_busy_seconds_total"};
+        static Metrics::CachedMetric decodeDuration{"compress_decode_duration_ms"};
+        static Metrics::CachedMetric decodeBandwidth{"compress_decode_bandwidth_gbps"};
+
+        const bool metricsEnabled = MetricsEnabled();
+        const bool detailedMetricsEnabled = DetailedMetricsEnabled();
+        if (detailedMetricsEnabled) {
+            const auto pickedTp = SteadyClock::now();
+            DecrementLoadQueueDepth(ct.task->id);
+            if (ct.enqueueTp != SteadyClock::time_point{}) {
+                const double queuedSeconds =
+                    std::chrono::duration<double>(pickedTp - ct.enqueueTp).count();
+                Metrics::UpdateStats(queueWait, queuedSeconds * 1e3);
+            }
+        }
+        if (failureSet_->Contains(ct.task->id)) {
+            ct.task->Fail(Status::Timeout());
             return;
         }
-    }
-
-    const auto& shards = ct.task->desc;
-    UC_DEBUG("COMPRESS LOAD | shards_count: {}", shards.size());
-
-    CodecModeCounts modeCounts;
-    size_t decodedShards = 0;
-    const auto decodeStart =
-        detailedMetricsEnabled ? SteadyClock::now() : SteadyClock::time_point{};
-    {
-        ActivityGuard decodeGuard(detailedMetricsEnabled ? &decodeActiveWorkers_ : nullptr);
-        for (const auto& shard : shards) {
-            const CodecPayloadMode payloadMode =
-                codec_->GetPayloadMode(shard.addrs[0], compressedShardSize_, shardSize_);
-            const int err = codec_->DecompressInplace(shard.addrs[0], shardSize_);
-            if (err != 0) {
-                UC_ERROR("COMPRESS LOAD FAILED | task_id: {}, shard: {}, error: {} ({})",
-                         ct.task->id, shard.index, err, CodecErrorName(err));
-                failureSet_->Insert(ct.task->id);
-                continue;
-            }
-            if (metricsEnabled) { ++decodedShards; }
-            modeCounts.Add(payloadMode);
-            UC_DEBUG("COMPRESS LOAD | shard: {}, done, decompressed_size: {}", shard.index,
-                     shardSize_);
+        if (metricsEnabled) {
+            Metrics::UpdateStats(loadTasks, 1.0);
+            Metrics::UpdateStats(loadShards, static_cast<double>(ct.task->desc.size()));
         }
-    }
-    if (metricsEnabled) {
-        const double decodedBytesValue = static_cast<double>(decodedShards) * shardSize_;
-        Metrics::UpdateStats(decodeBytes, decodedBytesValue);
+        ActivityGuard loadGuard(detailedMetricsEnabled ? &loadActiveWorkers_ : nullptr);
+
+        UC_DEBUG("COMPRESS LOAD START | task_id: {}", ct.task->id);
+        if (!codec_->NeedsDecompress()) {
+            auto result = backend_->Load(std::move(ct.task->desc));
+            if (!result) {
+                FailTask(ct.task, "LOAD", "backend submit", result.Error());
+                return;
+            }
+            if (result.Value() > 0) {
+                auto status = WaitLoadBackend(result.Value());
+                if (status.Failure()) {
+                    FailTask(ct.task, "LOAD", "backend wait", status);
+                    return;
+                }
+            }
+            UC_DEBUG("COMPRESS LOAD END | task_id: {}", ct.task->id);
+            return;
+        }
+
+        auto result = backend_->Load(ct.task->desc);
+        if (!result) {
+            FailTask(ct.task, "LOAD", "backend submit", result.Error());
+            return;
+        }
+        if (result.Value() > 0) {
+            auto status = WaitLoadBackend(result.Value());
+            if (status.Failure()) {
+                FailTask(ct.task, "LOAD", "backend wait", status);
+                return;
+            }
+        }
+
+        const auto& shards = ct.task->desc;
+        UC_DEBUG("COMPRESS LOAD | shards_count: {}", shards.size());
+
+        CodecModeCounts modeCounts;
+        size_t decodedShards = 0;
+        const auto decodeStart =
+            detailedMetricsEnabled ? SteadyClock::now() : SteadyClock::time_point{};
+        {
+            ActivityGuard decodeGuard(detailedMetricsEnabled ? &decodeActiveWorkers_ : nullptr);
+            for (const auto& shard : shards) {
+                const CodecPayloadMode payloadMode =
+                    detailedMetricsEnabled
+                        ? codec_->GetPayloadMode(shard.addrs.front(), compressedShardSize_,
+                                                 shardSize_)
+                        : CodecPayloadMode::NOT_APPLICABLE;
+                const int err = codec_->DecompressInplace(shard.addrs.front(), shardSize_);
+                if (err != 0) {
+                    FailTask(ct.task, "LOAD", "decompress",
+                             Status::Error(fmt::format("shard({}) codec error {} ({})", shard.index,
+                                                       err, CodecErrorName(err))));
+                    return;
+                }
+                if (metricsEnabled) { ++decodedShards; }
+                if (detailedMetricsEnabled) { modeCounts.Add(payloadMode); }
+                UC_DEBUG("COMPRESS LOAD | shard: {}, done, decompressed_size: {}", shard.index,
+                         shardSize_);
+            }
+        }
+        if (metricsEnabled) {
+            const double decodedBytesValue = static_cast<double>(decodedShards) * shardSize_;
+            Metrics::UpdateStats(decodeBytes, decodedBytesValue);
+            if (detailedMetricsEnabled) {
+                const double decodeSeconds = SecondsSince(decodeStart);
+                Metrics::UpdateStats(decodeBusySeconds, decodeSeconds);
+                Metrics::UpdateStats(decodeDuration, decodeSeconds * 1e3);
+                if (decodeSeconds > 0.0) {
+                    Metrics::UpdateStats(decodeBandwidth, decodedBytesValue / decodeSeconds / 1e9);
+                }
+            }
+        }
         if (detailedMetricsEnabled) {
-            const double decodeSeconds = SecondsSince(decodeStart);
-            Metrics::UpdateStats(decodeBusySeconds, decodeSeconds);
-            Metrics::UpdateStats(decodeDuration, decodeSeconds * 1e3);
-            if (decodeSeconds > 0.0) {
-                Metrics::UpdateStats(decodeBandwidth, decodedBytesValue / decodeSeconds / 1e9);
-            }
+            ReportCodecModeStats(ct.task->id, CodecStatsStage::LOAD, modeCounts);
         }
+        UC_DEBUG("COMPRESS LOAD END | task_id: {}", ct.task->id);
+    } catch (const std::exception& e) {
+        FailTask(ct.task, "LOAD", "worker exception", Status::Error(e.what()));
+    } catch (...) {
+        FailTask(ct.task, "LOAD", "worker exception", Status::Error("unknown exception"));
     }
-    ReportCodecModeStats(ct.task->id, CodecStatsStage::LOAD, modeCounts);
-
-    ct.waiter->Done();
-    UC_DEBUG("COMPRESS LOAD END | task_id: {}", ct.task->id);
 }
 
-void CompressorAction::Compress_Dump(CompressTask& ct)
+void CompressorAction::DumpWorker(CompressTask& ct)
 {
-    UC_DEBUG("COMPRESS DUMP START | task_id: {}", ct.task->id);
-    auto fail = [this, &ct](const char* stage, const Status& status) {
-        UC_ERROR("COMPRESS DUMP FAILED | task_id: {}, stage: {}, status: {}", ct.task->id, stage,
-                 status);
-        failureSet_->Insert(ct.task->id);
-    };
-
-    if (!codec_->NeedsCompress()) {
-        const auto n = ct.task->desc.size();
-        if (n > 0) {
+    CompletionGuard completion{ct.waiter};
+    try {
+        UC_DEBUG("COMPRESS DUMP START | task_id: {}", ct.task->id);
+        if (failureSet_->Contains(ct.task->id)) {
+            ct.task->Fail(Status::Timeout());
+            return;
+        }
+        if (!codec_->NeedsCompress()) {
             auto result = backend_->Dump(std::move(ct.task->desc));
             if (!result) {
-                fail("backend submit", result.Error());
-            } else {
+                FailTask(ct.task, "DUMP", "backend submit", result.Error());
+                return;
+            }
+            if (result.Value() > 0) {
                 auto status = backend_->Wait(result.Value());
-                if (status.Failure()) { fail("backend wait", status); }
+                if (status.Failure()) {
+                    FailTask(ct.task, "DUMP", "backend wait", status);
+                    return;
+                }
+            }
+            UC_DEBUG("COMPRESS DUMP END | task_id: {}", ct.task->id);
+            return;
+        }
+
+        const auto& desc = ct.task->desc;
+        const size_t scratchSize = codec_->CompressScratchSize(shardSize_);
+        AlignedBlocks buffers{scratchSize, desc.size()};
+        Detail::TaskDesc backendDesc;
+        backendDesc.brief = desc.brief;
+        backendDesc.reserve(desc.size());
+
+        CodecModeCounts modeCounts;
+        for (size_t i = 0; i < desc.size(); ++i) {
+            const auto& shard = desc[i];
+            UC_DEBUG("COMPRESS DUMP | task_id: {}, shard: {}, compressing...", ct.task->id,
+                     shard.index);
+
+            void* compressed = buffers.At(i);
+            const size_t compressedBytes =
+                codec_->Compress(compressed, shard.addrs.front(), shardSize_);
+            if (compressedBytes != compressedShardSize_) [[unlikely]] {
+                FailTask(
+                    ct.task, "DUMP", "compress",
+                    Status::Error(fmt::format("shard({}) expected {} B but codec produced {} B",
+                                              shard.index, compressedShardSize_, compressedBytes)));
+                return;
+            }
+            if (DetailedMetricsEnabled()) {
+                modeCounts.Add(codec_->GetPayloadMode(compressed, compressedBytes, shardSize_));
+            }
+
+            backendDesc.push_back(Detail::Shard{shard.owner, shard.index, {compressed}});
+            UC_DEBUG("COMPRESS DUMP | shard: {}, done, stored_size: {}", shard.index,
+                     compressedBytes);
+        }
+        auto result = backend_->Dump(std::move(backendDesc));
+        if (!result) {
+            FailTask(ct.task, "DUMP", "backend submit", result.Error());
+            return;
+        }
+        if (result.Value() > 0) {
+            auto status = backend_->Wait(result.Value());
+            if (status.Failure()) {
+                FailTask(ct.task, "DUMP", "backend wait", status);
+                return;
             }
         }
-        ct.waiter->Done();
+        if (DetailedMetricsEnabled()) {
+            ReportCodecModeStats(ct.task->id, CodecStatsStage::DUMP, modeCounts);
+        }
         UC_DEBUG("COMPRESS DUMP END | task_id: {}", ct.task->id);
-        return;
+    } catch (const std::exception& e) {
+        FailTask(ct.task, "DUMP", "worker exception", Status::Error(e.what()));
+    } catch (...) {
+        FailTask(ct.task, "DUMP", "worker exception", Status::Error("unknown exception"));
     }
-
-    const auto& desc = ct.task->desc;
-    if (desc.empty()) {
-        UC_ERROR("COMPRESS DUMP FAILED | task_id: {}, desc is empty", ct.task->id);
-        failureSet_->Insert(ct.task->id);
-        ct.waiter->Done();
-        return;
-    }
-
-    const size_t scratchSize = codec_->CompressScratchSize(shardSize_);
-    Detail::TaskDesc backendDesc;
-    backendDesc.brief = ct.task->desc.brief;
-    std::vector<void*> blockToFree;
-    auto dumpMemoryPool = std::make_unique<MemoryPool>(scratchSize, desc.size());
-
-    CodecModeCounts modeCounts;
-    for (const UC::Detail::Shard& shard : desc) {
-        UC_DEBUG("COMPRESS DUMP | task_id: {}, shard: {}, compressing...", ct.task->id,
-                 shard.index);
-
-        auto* compressed = static_cast<uint8_t*>(dumpMemoryPool->allocate());
-        const size_t compressedBytes = codec_->Compress(compressed, shard.addrs[0], shardSize_);
-        if (compressedBytes != compressedShardSize_) [[unlikely]] {
-            UC_ERROR(
-                "COMPRESS DUMP FAILED | task_id: {}, shard: {}, expected {} B but codec produced "
-                "{} B",
-                ct.task->id, shard.index, compressedShardSize_, compressedBytes);
-            dumpMemoryPool->deallocate({compressed});
-            continue;
-        }
-        modeCounts.Add(codec_->GetPayloadMode(compressed, compressedBytes, shardSize_));
-
-        std::vector<void*> addrs{static_cast<void*>(compressed)};
-        backendDesc.push_back(Detail::Shard{shard.owner, shard.index, addrs});
-        blockToFree.push_back(static_cast<void*>(compressed));
-        UC_DEBUG("COMPRESS DUMP | shard: {}, done, stored_size: {}", shard.index, compressedBytes);
-    }
-    if (backendDesc.size() != desc.size()) {
-        UC_ERROR(
-            "COMPRESS DUMP FAILED | task_id: {}, only {}/{} shards met the compression budget; "
-            "the whole dump is aborted",
-            ct.task->id, backendDesc.size(), desc.size());
-        failureSet_->Insert(ct.task->id);
-        if (!blockToFree.empty()) { dumpMemoryPool->deallocate(blockToFree); }
-        ct.waiter->Done();
-        return;
-    }
-
-    bool backendDumpSucceeded = false;
-    auto result = backend_->Dump(std::move(backendDesc));
-    if (!result) {
-        fail("backend submit", result.Error());
-    } else if (result.Value() > 0) {
-        auto status = backend_->Wait(result.Value());
-        if (status.Failure()) {
-            fail("backend wait", status);
-        } else {
-            backendDumpSucceeded = true;
-        }
-    } else {
-        backendDumpSucceeded = true;
-    }
-    if (backendDumpSucceeded) {
-        ReportCodecModeStats(ct.task->id, CodecStatsStage::DUMP, modeCounts);
-    }
-    if (!blockToFree.empty()) { dumpMemoryPool->deallocate(blockToFree); }
-
-    ct.waiter->Done();
-    UC_DEBUG("COMPRESS DUMP END | task_id: {}", ct.task->id);
 }
 
 }  // namespace UC::Compressor

@@ -29,24 +29,21 @@
 #include <string>
 #include <sys/types.h>
 #include <vector>
+#include "compress_lib/compress_types.h"
 #include "ucmstore_v1.h"
 
 namespace UC::Compressor {
 
 struct Config {
-    StoreV1* storeBackend;
-    std::string uniqueId{};
+    StoreV1* storeBackend{nullptr};
     int32_t deviceId{-1};
-    size_t tensorSize{0};
     size_t shardSize{0};
     size_t compressedShardSize{0};
-    size_t blockSize{0};
-    size_t layerSize{0};
     size_t timeoutMs{30000};
     int32_t compressRatio{32};
-    int32_t dataType{100};
+    DataType dataType{DT_INVALID};
     std::string metricsLevel{"basic"};
-    size_t streamNumber{8};
+    size_t compressThreadNum{4};
     size_t decompressThreadNum{6};
     std::vector<ssize_t> cpuAffinityCores{};
 };
