@@ -47,6 +47,8 @@ struct Config {
     int32_t dataType{100};
     size_t streamNumber{8};
     size_t decompressThreadNum{6};
+    size_t readyPollUs{10};  // 0: busy polling while reads are pending
+    size_t maxActiveLoads{128};
     std::vector<ssize_t> cpuAffinityCores{};
 };
 

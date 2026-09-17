@@ -60,7 +60,8 @@ private:
     size_t compressedShardSize_{0};
     size_t decompressThreadNum_{6};
     size_t timeoutMs_{30000};
-    static constexpr size_t kMaxActiveLoads = 128;
+    size_t maxActiveLoads_{128};
+    size_t readyPollUs_{10};
     static constexpr size_t kMaxOutstandingWork = 8192;
     std::unique_ptr<Codec> codec_;
 

@@ -69,6 +69,8 @@ Status Compressor::Setup(const Detail::Dictionary& config)
     config.GetNumber("compress_ratio", param.compressRatio);
     config.GetNumber("data_type", param.dataType);
     config.GetNumber("decompress_thread_num", param.decompressThreadNum);
+    config.GetNumber("compress_ready_poll_us", param.readyPollUs);
+    config.GetNumber("compress_max_active_loads", param.maxActiveLoads);
     config.GetNumber("timeout_ms", param.timeoutMs);
     config.GetNumber("stream_number", param.streamNumber);
     config.Get("cpu_affinity_cores", param.cpuAffinityCores);

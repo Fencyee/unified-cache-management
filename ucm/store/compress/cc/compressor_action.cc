@@ -107,6 +107,14 @@ Status CompressorAction::Setup(const Config& config, FailureSet* failureSet)
     compressedShardSize_ = config.compressedShardSize;
     decompressThreadNum_ = config.decompressThreadNum;
     timeoutMs_ = config.timeoutMs;
+    maxActiveLoads_ = config.maxActiveLoads;
+    readyPollUs_ = config.readyPollUs;
+    if (maxActiveLoads_ == 0 || maxActiveLoads_ > kMaxOutstandingWork) {
+        return Status::InvalidParam("compress_max_active_loads must be in [1,8192]");
+    }
+    if (readyPollUs_ > 1000000) {
+        return Status::InvalidParam("compress_ready_poll_us must be in [0,1000000]");
+    }
 
     if (backend_ == nullptr) { return Status::InvalidParam("invalid store backend"); }
     if (decompressThreadNum_ == 0) {
@@ -164,7 +172,7 @@ Status CompressorAction::Setup(const Config& config, FailureSet* failureSet)
     if (!success) { return Status::Error("Failed to start backend load submit worker pool"); }
 
     try {
-        incomingLoads_.reserve(kMaxActiveLoads);
+        incomingLoads_.reserve(maxActiveLoads_);
         completionThread_ = std::thread([this, cores = config.cpuAffinityCores] {
             CpuAffinity::SetCurrentThreadName("ucm_cmp_ready");
             if (!cores.empty()) { CpuAffinity::SetCpuAffinity4CurrentThread(cores); }
@@ -176,8 +184,8 @@ Status CompressorAction::Setup(const Config& config, FailureSet* failureSet)
 
     UC_INFO(
         "Compressor Setup | load_pipeline=submit(1)->ready(1)->decompress({}), "
-        "max_active_loads={}, max_outstanding_work={}, shard_size={} B, stored_shard_size={} B",
-        decompressThreadNum_, kMaxActiveLoads, kMaxOutstandingWork, shardSize_,
+        "max_active_loads={}, ready_poll_us={}, max_outstanding_work={}, shard_size={} B, stored_shard_size={} B",
+        decompressThreadNum_, maxActiveLoads_, readyPollUs_, kMaxOutstandingWork, shardSize_,
         compressedShardSize_);
     return Status::OK();
 }
@@ -471,7 +479,7 @@ void CompressorAction::CompletionLoop() noexcept
     // StoreV1 has Check/Wait but no completion callback. Scan the bounded active
     // set, skipping unfinished handles; never Wait on a healthy unfinished read.
     std::vector<LoadWaitCtx> pending;
-    pending.reserve(kMaxActiveLoads);
+    pending.reserve(maxActiveLoads_);
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(completionMtx_);
@@ -526,9 +534,11 @@ void CompressorAction::CompletionLoop() noexcept
                 WaitLoadShard(done);
             }
         }
-        if (!progressed && !pending.empty()) {
+        // Zero is an explicit diagnostic busy-poll mode. Empty queues still
+        // sleep above; unfinished I/O never enters a blocking Wait here.
+        if (!progressed && !pending.empty() && readyPollUs_ != 0) {
             std::unique_lock<std::mutex> lock(completionMtx_);
-            completionCv_.wait_for(lock, std::chrono::microseconds(10), [this] {
+            completionCv_.wait_for(lock, std::chrono::microseconds(readyPollUs_), [this] {
                 return completionStop_ || !incomingLoads_.empty();
             });
         }
@@ -656,7 +666,7 @@ void CompressorAction::CompleteWork() noexcept
 void CompressorAction::AcquireLoadSlot()
 {
     std::unique_lock<std::mutex> lock(activeLoadMtx_);
-    activeLoadCv_.wait(lock, [this] { return activeLoads_ < kMaxActiveLoads; });
+    activeLoadCv_.wait(lock, [this] { return activeLoads_ < maxActiveLoads_; });
     ++activeLoads_;
 }
 
@@ -669,7 +679,7 @@ void CompressorAction::ReleaseLoadSlot() noexcept
             UC_ERROR("Compressor load pipeline counter underflow");
             return;
         }
-        wasFull = activeLoads_ == kMaxActiveLoads;
+        wasFull = activeLoads_ == maxActiveLoads_;
         --activeLoads_;
     }
     if (wasFull) { activeLoadCv_.notify_one(); }
