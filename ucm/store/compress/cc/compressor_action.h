@@ -2,6 +2,9 @@
 #define UNIFIEDCACHE_COMPRESSOR_CC_ACTION_H
 
 #include <atomic>
+#include <chrono>
+#include <thread>
+#include <vector>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -47,6 +50,7 @@ class CompressorAction {
     struct LoadWaitCtx {
         LoadShardCtx shard;
         Detail::TaskHandle backendHandle{0};
+        std::chrono::steady_clock::time_point submittedAt{std::chrono::steady_clock::now()};
     };
 
 private:
@@ -55,6 +59,7 @@ private:
     size_t shardSize_{0};
     size_t compressedShardSize_{0};
     size_t decompressThreadNum_{6};
+    size_t timeoutMs_{30000};
     static constexpr size_t kMaxActiveLoads = 128;
     static constexpr size_t kMaxOutstandingWork = 8192;
     std::unique_ptr<Codec> codec_;
@@ -63,8 +68,15 @@ private:
     // ThreadPool members are destroyed in reverse pipeline order: submit, wait, decode, dump.
     ThreadPool<CompressTask> dumpPool_;
     ThreadPool<LoadShardCtx> decodePool_;
+    // Only failed checks / expired handles use a blocking drain worker.
     ThreadPool<LoadWaitCtx> waitPool_;
     ThreadPool<LoadShardCtx> submitPool_;
+
+    std::mutex completionMtx_;
+    std::condition_variable completionCv_;
+    std::vector<LoadWaitCtx> incomingLoads_;
+    std::thread completionThread_;
+    bool completionStop_{false};
 
     std::mutex lifecycleMtx_;
     std::condition_variable lifecycleCv_;
@@ -86,6 +98,8 @@ private:
 
     void SubmitLoadShard(LoadShardCtx& ctx) noexcept;
     void WaitLoadShard(LoadWaitCtx& ctx) noexcept;
+    void CompletionLoop() noexcept;
+    void EnqueueCompletion(LoadWaitCtx ctx);
     void DecodeLoadShard(LoadShardCtx& ctx) noexcept;
 
     bool RegisterWork(size_t count);

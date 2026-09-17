@@ -3,6 +3,7 @@
 #include <exception>
 #include <vector>
 #include "logger/logger.h"
+#include "thread/cpu_affinity.h"
 
 namespace UC::Compressor {
 namespace {
@@ -89,6 +90,13 @@ CompressorAction::~CompressorAction()
     std::unique_lock<std::mutex> lock(lifecycleMtx_);
     accepting_ = false;
     lifecycleCv_.wait(lock, [this] { return outstandingWork_ == 0; });
+    lock.unlock();
+    {
+        std::lock_guard<std::mutex> completionLock(completionMtx_);
+        completionStop_ = true;
+    }
+    completionCv_.notify_one();
+    if (completionThread_.joinable()) { completionThread_.join(); }
 }
 
 Status CompressorAction::Setup(const Config& config, FailureSet* failureSet)
@@ -98,6 +106,7 @@ Status CompressorAction::Setup(const Config& config, FailureSet* failureSet)
     shardSize_ = config.shardSize;
     compressedShardSize_ = config.compressedShardSize;
     decompressThreadNum_ = config.decompressThreadNum;
+    timeoutMs_ = config.timeoutMs;
 
     if (backend_ == nullptr) { return Status::InvalidParam("invalid store backend"); }
     if (decompressThreadNum_ == 0) {
@@ -141,8 +150,7 @@ Status CompressorAction::Setup(const Config& config, FailureSet* failureSet)
                   .Run();
     if (!success) { return Status::Error("Failed to start decompress worker pool"); }
 
-    // Posix AIO performs the actual reads concurrently. A single ordered Wait stage mirrors the
-    // Cache transfer stage and avoids creating another decompressThreadNum blocking threads.
+    // Error/timeout draining must not block readiness checks for healthy reads.
     success = waitPool_.SetNWorker(1)
                   .SetCpuAffinity(config.cpuAffinityCores)
                   .SetWorkerFn([this](auto& ctx, auto&) { WaitLoadShard(ctx); })
@@ -155,8 +163,19 @@ Status CompressorAction::Setup(const Config& config, FailureSet* failureSet)
                   .Run();
     if (!success) { return Status::Error("Failed to start backend load submit worker pool"); }
 
+    try {
+        incomingLoads_.reserve(kMaxActiveLoads);
+        completionThread_ = std::thread([this, cores = config.cpuAffinityCores] {
+            CpuAffinity::SetCurrentThreadName("ucm_cmp_ready");
+            if (!cores.empty()) { CpuAffinity::SetCpuAffinity4CurrentThread(cores); }
+            CompletionLoop();
+        });
+    } catch (const std::exception& e) {
+        return Status::Error(fmt::format("Failed to start completion monitor: {}", e.what()));
+    }
+
     UC_INFO(
-        "Compressor Setup | load_pipeline=submit(1)->wait(1)->decompress({}), "
+        "Compressor Setup | load_pipeline=submit(1)->ready(1)->decompress({}), "
         "max_active_loads={}, max_outstanding_work={}, shard_size={} B, stored_shard_size={} B",
         decompressThreadNum_, kMaxActiveLoads, kMaxOutstandingWork, shardSize_,
         compressedShardSize_);
@@ -417,7 +436,7 @@ void CompressorAction::SubmitLoadShard(LoadShardCtx& ctx) noexcept
             return;
         }
 
-        waitPool_.Push(LoadWaitCtx{ctx, backendHandle});
+        EnqueueCompletion(LoadWaitCtx{ctx, backendHandle});
         return;
     } catch (const std::exception& e) {
         UC_ERROR("COMPRESS LOAD FAILED | task_id: {}, shard offset: {}, stage: submit, error: {}",
@@ -436,6 +455,84 @@ void CompressorAction::SubmitLoadShard(LoadShardCtx& ctx) noexcept
         (void)WaitBackendHandle(backendHandle, taskId, "LoadSubmitWorker recovery");
     }
     FinishLoadShard(ctx, CodecPayloadMode::NOT_APPLICABLE, holdsLoadSlot);
+}
+
+void CompressorAction::EnqueueCompletion(LoadWaitCtx ctx)
+{
+    {
+        std::lock_guard<std::mutex> lock(completionMtx_);
+        incomingLoads_.push_back(std::move(ctx));
+    }
+    completionCv_.notify_one();
+}
+
+void CompressorAction::CompletionLoop() noexcept
+{
+    // StoreV1 has Check/Wait but no completion callback. Scan the bounded active
+    // set, skipping unfinished handles; never Wait on a healthy unfinished read.
+    std::vector<LoadWaitCtx> pending;
+    pending.reserve(kMaxActiveLoads);
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(completionMtx_);
+            if (pending.empty()) {
+                completionCv_.wait(lock, [this] {
+                    return completionStop_ || !incomingLoads_.empty();
+                });
+            }
+            if (completionStop_) { return; }
+            for (auto& ctx : incomingLoads_) { pending.push_back(std::move(ctx)); }
+            incomingLoads_.clear();
+        }
+        bool progressed = false;
+        for (size_t i = 0; i < pending.size();) {
+            auto& ctx = pending[i];
+            bool ready = false;
+            bool drain = false;
+            try {
+                auto result = backend_->Check(ctx.backendHandle);
+                if (result) {
+                    ready = result.Value();
+                } else {
+                    drain = true;
+                }
+            } catch (...) {
+                drain = true;
+            }
+            if (!ready && timeoutMs_ != 0 &&
+                std::chrono::steady_clock::now() - ctx.submittedAt >=
+                    std::chrono::milliseconds(timeoutMs_)) {
+                drain = true;
+            }
+            if (!ready && !drain) {
+                ++i;
+                continue;
+            }
+            auto done = std::move(ctx);
+            pending.erase(pending.begin() + i);
+            progressed = true;
+            if (drain && !ready) {
+                // Wait still owns timeout/cancellation and safe I/O draining.
+                // Keep the slot and buffer alive until it returns.
+                try {
+                    waitPool_.Push(std::move(done));
+                } catch (...) {
+                    // Losing a submitted handle could release an active I/O buffer.
+                    std::terminate();
+                }
+            } else {
+                // Check=true is terminal, including failed I/O. Wait consumes the
+                // handle and obtains its final status before dispatching decode.
+                WaitLoadShard(done);
+            }
+        }
+        if (!progressed && !pending.empty()) {
+            std::unique_lock<std::mutex> lock(completionMtx_);
+            completionCv_.wait_for(lock, std::chrono::microseconds(10), [this] {
+                return completionStop_ || !incomingLoads_.empty();
+            });
+        }
+    }
 }
 
 void CompressorAction::WaitLoadShard(LoadWaitCtx& ctx) noexcept

@@ -288,3 +288,32 @@ Do not enable Compress Store by default in the following situations without addi
 - Non-BF16 KV cache formats, which are not supported by the current codecs.
 - Accuracy-sensitive workloads that have not completed R160/R200 quality evaluation.
 - Pure HBM/DRAM cache scenarios without external-storage loading.
+
+### 方案 C：按读取就绪状态派发解压
+
+Load 路径为 `submit(1) → ready(1) → decompress(N)`。Cache 仍逐 shard 提交，
+并在自己的 transfer 线程中按既有顺序等待解压完成、提交 H2D。
+
+Compress 的 ready 线程调用底层 `StoreV1::Check` 检查全部在途句柄，跳过未完成的读取。
+只要某个句柄完成，就调用 `Wait` 回收句柄、取得最终状态，成功后送入解码线程池。
+因此前面的慢 I/O 不会阻止后面已读完的 shard 开始解码；POSIX psync 和 aio 均适用。
+这不要求严格按 I/O 的物理完成时间排序，只保证不因较早提交的未完成读取而阻塞。
+
+当前 StoreV1 没有完成回调接口，实现采用有界扫描（最多128个活跃 shard）。
+没有新完成项时，以10微秒的条件变量等待避免持续忙轮询；实际唤醒延迟由操作系统调度决定。
+空闲且没有在途任务时等待新提交通知。该等待与队列交接本身有开销，端到端提速需实测。
+
+Check 出错或超过 timeout_ms 仍未完成的句柄进入独立的阻塞收尾线程，继续通过原有 Wait
+处理状态和等待底层停止访问缓冲区。收尾等待不阻塞正常就绪检查；在安全回收前仍占用活跃名额。
+析构会等待所有已接收任务结束，再停止 ready 线程。未改变128个活跃名额和8192个待处理工作的上限。
+
+模拟环境回归测试：
+
+```bash
+cmake -S . -B build -DRUNTIME_ENVIRONMENT=simu -DCMAKE_BUILD_TYPE=Release -DBUILD_UNIT_TESTS=ON
+cmake --build build --target ucmstore.test -j8
+./build/ucm/store/test/ucmstore.test --gtest_filter='CompletionPaths/*'
+```
+
+测试使用真实 R160 编解码和可控的模拟存储完成状态，覆盖首个读取被阻塞而第二个先解码、
+Check失败/超时收尾不阻塞其他读取、读取失败不解码，以及退出前必须等待在途读取安全结束。
